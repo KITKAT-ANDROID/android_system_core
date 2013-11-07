@@ -78,9 +78,9 @@ struct {
     { "runtime.",         AID_SYSTEM,   0 },
     { "hw.",              AID_SYSTEM,   0 },
     { "sys.",             AID_SYSTEM,   0 },
+    { "sys.powerctl",     AID_SHELL,    0 },
     { "service.",         AID_SYSTEM,   0 },
     { "wlan.",            AID_SYSTEM,   0 },
-    { "gps.",             AID_GPS,      0 },
     { "bluetooth.",       AID_BLUETOOTH,   0 },
     { "dhcp.",            AID_SYSTEM,   0 },
     { "dhcp.",            AID_DHCP,     0 },
@@ -92,7 +92,6 @@ struct {
     { "persist.sys.",     AID_SYSTEM,   0 },
     { "persist.service.", AID_SYSTEM,   0 },
     { "persist.security.", AID_SYSTEM,   0 },
-    { "persist.gps.",      AID_GPS,      0 },
     { "persist.service.bdroid.", AID_BLUETOOTH,   0 },
     { "selinux."         , AID_SYSTEM,   0 },
     { NULL, 0, 0 }
@@ -250,7 +249,7 @@ static int check_perms(const char *name, unsigned int uid, unsigned int gid, cha
     return 0;
 }
 
-int __property_get(const char *name, char *value)
+int property_get(const char *name, char value[PROP_VALUE_MAX])
 {
     return __system_property_get(name, value);
 }
@@ -277,6 +276,34 @@ static void write_persistent_property(const char *name, const char *value)
     }
 }
 
+static bool is_legal_property_name(const char* name, size_t namelen)
+{
+    size_t i;
+    bool previous_was_dot = false;
+    if (namelen >= PROP_NAME_MAX) return false;
+    if (namelen < 1) return false;
+    if (name[0] == '.') return false;
+    if (name[namelen - 1] == '.') return false;
+
+    /* Only allow alphanumeric, plus '.', '-', or '_' */
+    /* Don't allow ".." to appear in a property name */
+    for (i = 0; i < namelen; i++) {
+        if (name[i] == '.') {
+            if (previous_was_dot == true) return false;
+            previous_was_dot = true;
+            continue;
+        }
+        previous_was_dot = false;
+        if (name[i] == '_' || name[i] == '-') continue;
+        if (name[i] >= 'a' && name[i] <= 'z') continue;
+        if (name[i] >= 'A' && name[i] <= 'Z') continue;
+        if (name[i] >= '0' && name[i] <= '9') continue;
+        return false;
+    }
+
+    return true;
+}
+
 int property_set(const char *name, const char *value)
 {
     prop_info *pi;
@@ -285,9 +312,8 @@ int property_set(const char *name, const char *value)
     size_t namelen = strlen(name);
     size_t valuelen = strlen(value);
 
-    if(namelen >= PROP_NAME_MAX) return -1;
-    if(valuelen >= PROP_VALUE_MAX) return -1;
-    if(namelen < 1) return -1;
+    if (!is_legal_property_name(name, namelen)) return -1;
+    if (valuelen >= PROP_VALUE_MAX) return -1;
 
     pi = (prop_info*) __system_property_find(name);
 
@@ -299,7 +325,7 @@ int property_set(const char *name, const char *value)
     } else {
         ret = __system_property_add(name, namelen, value, valuelen);
         if (ret < 0) {
-            ERROR("Failed to set '%s'='%s'", name, value);
+            ERROR("Failed to set '%s'='%s'\n", name, value);
             return ret;
         }
     }
@@ -365,6 +391,12 @@ void handle_property_set_fd()
         msg.name[PROP_NAME_MAX-1] = 0;
         msg.value[PROP_VALUE_MAX-1] = 0;
 
+        if (!is_legal_property_name(msg.name, strlen(msg.name))) {
+            ERROR("sys_prop: illegal property name. Got: \"%s\"\n", msg.name);
+            close(s);
+            return;
+        }
+
         getpeercon(s, &source_ctx);
 
         if(memcmp(msg.name,"ctl.",4) == 0) {
@@ -405,13 +437,10 @@ void get_property_workspace(int *fd, int *sz)
     *sz = pa_workspace.size;
 }
 
-static void load_properties(char *data, char *prefix)
+static void load_properties(char *data)
 {
     char *key, *value, *eol, *sol, *tmp;
-    size_t plen;
 
-    if (prefix)
-        plen = strlen(prefix);
     sol = data;
     while((eol = strchr(sol, '\n'))) {
         key = sol;
@@ -427,9 +456,6 @@ static void load_properties(char *data, char *prefix)
         tmp = value - 2;
         while((tmp > key) && isspace(*tmp)) *tmp-- = 0;
 
-        if (prefix && strncmp(key, prefix, plen))
-            continue;
-
         while(isspace(*value)) value++;
         tmp = eol - 2;
         while((tmp > value) && isspace(*tmp)) *tmp-- = 0;
@@ -438,7 +464,7 @@ static void load_properties(char *data, char *prefix)
     }
 }
 
-static void load_properties_from_file(const char *fn, char *prefix)
+static void load_properties_from_file(const char *fn)
 {
     char *data;
     unsigned sz;
@@ -446,7 +472,7 @@ static void load_properties_from_file(const char *fn, char *prefix)
     data = read_file(fn, &sz);
 
     if(data != 0) {
-        load_properties(data, prefix);
+        load_properties(data);
         free(data);
     }
 }
@@ -519,7 +545,7 @@ void property_init(void)
 
 void property_load_boot_defaults(void)
 {
-    load_properties_from_file(PROP_PATH_RAMDISK_DEFAULT, NULL);
+    load_properties_from_file(PROP_PATH_RAMDISK_DEFAULT);
 }
 
 int properties_inited(void)
@@ -534,7 +560,7 @@ static void load_override_properties() {
 
     ret = property_get("ro.debuggable", debuggable);
     if (ret && (strcmp(debuggable, "1") == 0)) {
-        load_properties_from_file(PROP_PATH_LOCAL_OVERRIDE, NULL);
+        load_properties_from_file(PROP_PATH_LOCAL_OVERRIDE);
     }
 #endif /* ALLOW_LOCAL_PROP_OVERRIDE */
 }
@@ -556,14 +582,13 @@ void start_property_service(void)
 {
     int fd;
 
-    load_properties_from_file(PROP_PATH_SYSTEM_BUILD, NULL);
-    load_properties_from_file(PROP_PATH_SYSTEM_DEFAULT, NULL);
-    load_properties_from_file(PROP_PATH_FACTORY, "ro.");
+    load_properties_from_file(PROP_PATH_SYSTEM_BUILD);
+    load_properties_from_file(PROP_PATH_SYSTEM_DEFAULT);
     load_override_properties();
     /* Read persistent properties after all default values have been loaded. */
     load_persistent_properties();
 
-    fd = create_socket(PROP_SERVICE_NAME, SOCK_STREAM, 0666, 0, 0, NULL);
+    fd = create_socket(PROP_SERVICE_NAME, SOCK_STREAM, 0666, 0, 0);
     if(fd < 0) return;
     fcntl(fd, F_SETFD, FD_CLOEXEC);
     fcntl(fd, F_SETFL, O_NONBLOCK);
