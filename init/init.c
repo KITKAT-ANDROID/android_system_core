@@ -42,6 +42,7 @@
 #include <cutils/android_reboot.h>
 #include <cutils/sockets.h>
 #include <cutils/iosched_policy.h>
+#include <cutils/fs.h>
 #include <private/android_filesystem_config.h>
 #include <termios.h>
 
@@ -58,6 +59,7 @@
 #include "util.h"
 #include "ueventd.h"
 #include "watchdogd.h"
+#include "vendor_init.h"
 
 struct selabel_handle *sehandle;
 struct selabel_handle *sehandle_prop;
@@ -249,12 +251,14 @@ void service_start(struct service *svc, const char *dynamic_args)
         for (ei = svc->envvars; ei; ei = ei->next)
             add_environment(ei->name, ei->value);
 
+        setsockcreatecon(scon);
+
         for (si = svc->sockets; si; si = si->next) {
             int socket_type = (
                     !strcmp(si->type, "stream") ? SOCK_STREAM :
                         (!strcmp(si->type, "dgram") ? SOCK_DGRAM : SOCK_SEQPACKET));
             int s = create_socket(si->name, socket_type,
-                                  si->perm, si->uid, si->gid, si->socketcon ?: scon);
+                                  si->perm, si->uid, si->gid);
             if (s >= 0) {
                 publish_socket(si->name, s);
             }
@@ -262,6 +266,7 @@ void service_start(struct service *svc, const char *dynamic_args)
 
         freecon(scon);
         scon = NULL;
+        setsockcreatecon(NULL);
 
         if (svc->ioprio_class != IoSchedClass_NONE) {
             if (android_set_ioprio(getpid(), svc->ioprio_class, svc->ioprio_pri)) {
@@ -556,6 +561,84 @@ static int wait_for_coldboot_done_action(int nargs, char **args)
     return ret;
 }
 
+/*
+ * Writes 512 bytes of output from Hardware RNG (/dev/hw_random, backed
+ * by Linux kernel's hw_random framework) into Linux RNG's via /dev/urandom.
+ * Does nothing if Hardware RNG is not present.
+ *
+ * Since we don't yet trust the quality of Hardware RNG, these bytes are not
+ * mixed into the primary pool of Linux RNG and the entropy estimate is left
+ * unmodified.
+ *
+ * If the HW RNG device /dev/hw_random is present, we require that at least
+ * 512 bytes read from it are written into Linux RNG. QA is expected to catch
+ * devices/configurations where these I/O operations are blocking for a long
+ * time. We do not reboot or halt on failures, as this is a best-effort
+ * attempt.
+ */
+static int mix_hwrng_into_linux_rng_action(int nargs, char **args)
+{
+    int result = -1;
+    int hwrandom_fd = -1;
+    int urandom_fd = -1;
+    char buf[512];
+    ssize_t chunk_size;
+    size_t total_bytes_written = 0;
+
+    hwrandom_fd = TEMP_FAILURE_RETRY(
+            open("/dev/hw_random", O_RDONLY | O_NOFOLLOW));
+    if (hwrandom_fd == -1) {
+        if (errno == ENOENT) {
+          ERROR("/dev/hw_random not found\n");
+          /* It's not an error to not have a Hardware RNG. */
+          result = 0;
+        } else {
+          ERROR("Failed to open /dev/hw_random: %s\n", strerror(errno));
+        }
+        goto ret;
+    }
+
+    urandom_fd = TEMP_FAILURE_RETRY(
+            open("/dev/urandom", O_WRONLY | O_NOFOLLOW));
+    if (urandom_fd == -1) {
+        ERROR("Failed to open /dev/urandom: %s\n", strerror(errno));
+        goto ret;
+    }
+
+    while (total_bytes_written < sizeof(buf)) {
+        chunk_size = TEMP_FAILURE_RETRY(
+                read(hwrandom_fd, buf, sizeof(buf) - total_bytes_written));
+        if (chunk_size == -1) {
+            ERROR("Failed to read from /dev/hw_random: %s\n", strerror(errno));
+            goto ret;
+        } else if (chunk_size == 0) {
+            ERROR("Failed to read from /dev/hw_random: EOF\n");
+            goto ret;
+        }
+
+        chunk_size = TEMP_FAILURE_RETRY(write(urandom_fd, buf, chunk_size));
+        if (chunk_size == -1) {
+            ERROR("Failed to write to /dev/urandom: %s\n", strerror(errno));
+            goto ret;
+        }
+        total_bytes_written += chunk_size;
+    }
+
+    INFO("Mixed %d bytes from /dev/hw_random into /dev/urandom",
+                total_bytes_written);
+    result = 0;
+
+ret:
+    if (hwrandom_fd != -1) {
+        close(hwrandom_fd);
+    }
+    if (urandom_fd != -1) {
+        close(urandom_fd);
+    }
+    memset(buf, 0, sizeof(buf));
+    return result;
+}
+
 static int keychord_init_action(int nargs, char **args)
 {
     keychord_init();
@@ -575,28 +658,29 @@ static int console_init_action(int nargs, char **args)
         have_console = 1;
     close(fd);
 
-    fd = open("/dev/tty0", O_WRONLY);
-    if (fd >= 0) {
-        const char *msg;
-            msg = "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"  // console is 40 cols x 30 lines
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "             A N D R O I D ";
-        write(fd, msg, strlen(msg));
-        close(fd);
+    if( load_565rle_image(INIT_IMAGE_FILE) ) {
+        fd = open("/dev/tty0", O_WRONLY);
+        if (fd >= 0) {
+            const char *msg;
+                msg = "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"  // console is 40 cols x 30 lines
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "             A N D R O I D ";
+            write(fd, msg, strlen(msg));
+            close(fd);
+        }
     }
-
     return 0;
 }
 
@@ -711,6 +795,11 @@ static int property_service_init_action(int nargs, char **args)
      * that /data/local.prop cannot interfere with them.
      */
     start_property_service();
+
+    /* update with vendor-specific property runtime
+     * overrides
+     */
+    vendor_load_properties();
     return 0;
 }
 
@@ -958,6 +1047,7 @@ int main(int argc, char **argv)
     action_for_each_trigger("early-init", action_add_queue_tail);
 
     queue_builtin_action(wait_for_coldboot_done_action, "wait_for_coldboot_done");
+    queue_builtin_action(mix_hwrng_into_linux_rng_action, "mix_hwrng_into_linux_rng");
     queue_builtin_action(keychord_init_action, "keychord_init");
     queue_builtin_action(console_init_action, "console_init");
 
@@ -971,6 +1061,11 @@ int main(int argc, char **argv)
         action_for_each_trigger("post-fs", action_add_queue_tail);
         action_for_each_trigger("post-fs-data", action_add_queue_tail);
     }
+
+    /* Repeat mix_hwrng_into_linux_rng in case /dev/hw_random or /dev/random
+     * wasn't ready immediately after wait_for_coldboot_done
+     */
+    queue_builtin_action(mix_hwrng_into_linux_rng_action, "mix_hwrng_into_linux_rng");
 
     queue_builtin_action(property_service_init_action, "property_service_init");
     queue_builtin_action(signal_init_action, "signal_init");

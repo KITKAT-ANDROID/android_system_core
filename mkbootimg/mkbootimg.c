@@ -65,6 +65,7 @@ int usage(void)
             "       [ --board <boardname> ]\n"
             "       [ --base <address> ]\n"
             "       [ --pagesize <pagesize> ]\n"
+            "       [ --dt <filename> ]\n"
             "       -o|--output <filename>\n"
             );
     return 1;
@@ -105,6 +106,8 @@ int main(int argc, char **argv)
     char *cmdline = "";
     char *bootimg = 0;
     char *board = "";
+    char *dt_fn = 0;
+    void *dt_data = 0;
     unsigned pagesize = 2048;
     int fd;
     SHA_CTX ctx;
@@ -114,7 +117,6 @@ int main(int argc, char **argv)
     unsigned ramdisk_offset = 0x01000000;
     unsigned second_offset  = 0x00f00000;
     unsigned tags_offset    = 0x00000100;
-    size_t cmdlen;
 
     argc--;
     argv++;
@@ -158,6 +160,8 @@ int main(int argc, char **argv)
                 fprintf(stderr,"error: unsupported page size %d\n", pagesize);
                 return -1;
             }
+        } else if(!strcmp(arg, "--dt")) {
+            dt_fn = val;
         } else {
             return usage();
         }
@@ -193,19 +197,11 @@ int main(int argc, char **argv)
 
     memcpy(hdr.magic, BOOT_MAGIC, BOOT_MAGIC_SIZE);
 
-    cmdlen = strlen(cmdline);
-    if(cmdlen > (BOOT_ARGS_SIZE + BOOT_EXTRA_ARGS_SIZE - 2)) {
+    if(strlen(cmdline) > (BOOT_ARGS_SIZE - 1)) {
         fprintf(stderr,"error: kernel commandline too large\n");
         return 1;
     }
-    /* Even if we need to use the supplemental field, ensure we
-     * are still NULL-terminated */
-    strncpy((char *)hdr.cmdline, cmdline, BOOT_ARGS_SIZE - 1);
-    hdr.cmdline[BOOT_ARGS_SIZE - 1] = '\0';
-    if (cmdlen >= (BOOT_ARGS_SIZE - 1)) {
-        cmdline += (BOOT_ARGS_SIZE - 1);
-        strncpy((char *)hdr.extra_cmdline, cmdline, BOOT_EXTRA_ARGS_SIZE);
-    }
+    strcpy((char*)hdr.cmdline, cmdline);
 
     kernel_data = load_file(kernel_fn, &hdr.kernel_size);
     if(kernel_data == 0) {
@@ -232,6 +228,14 @@ int main(int argc, char **argv)
         }
     }
 
+    if(dt_fn) {
+        dt_data = load_file(dt_fn, &hdr.dt_size);
+        if (dt_data == 0) {
+            fprintf(stderr,"error: could not load device tree image '%s'\n", dt_fn);
+            return 1;
+        }
+    }
+
     /* put a hash of the contents in the header so boot images can be
      * differentiated based on their first 2k.
      */
@@ -242,6 +246,10 @@ int main(int argc, char **argv)
     SHA_update(&ctx, &hdr.ramdisk_size, sizeof(hdr.ramdisk_size));
     SHA_update(&ctx, second_data, hdr.second_size);
     SHA_update(&ctx, &hdr.second_size, sizeof(hdr.second_size));
+    if(dt_data) {
+        SHA_update(&ctx, dt_data, hdr.dt_size);
+        SHA_update(&ctx, &hdr.dt_size, sizeof(hdr.dt_size));
+    }
     sha = SHA_final(&ctx);
     memcpy(hdr.id, sha,
            SHA_DIGEST_SIZE > sizeof(hdr.id) ? sizeof(hdr.id) : SHA_DIGEST_SIZE);
@@ -266,6 +274,10 @@ int main(int argc, char **argv)
         if(write_padding(fd, pagesize, hdr.ramdisk_size)) goto fail;
     }
 
+    if(dt_data) {
+        if(write(fd, dt_data, hdr.dt_size) != hdr.dt_size) goto fail;
+        if(write_padding(fd, pagesize, hdr.dt_size)) goto fail;
+    }
     return 0;
 
 fail:

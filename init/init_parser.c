@@ -130,10 +130,11 @@ int lookup_keyword(const char *s)
         if (!strcmp(s, "neshot")) return K_oneshot;
         if (!strcmp(s, "nrestart")) return K_onrestart;
         break;
+    case 'p':
+        if (!strcmp(s, "owerctl")) return K_powerctl;
     case 'r':
         if (!strcmp(s, "estart")) return K_restart;
         if (!strcmp(s, "estorecon")) return K_restorecon;
-        if (!strcmp(s, "estorecon_recursive")) return K_restorecon_recursive;
         if (!strcmp(s, "mdir")) return K_rmdir;
         if (!strcmp(s, "m")) return K_rm;
         break;
@@ -150,6 +151,7 @@ int lookup_keyword(const char *s)
         if (!strcmp(s, "ocket")) return K_socket;
         if (!strcmp(s, "tart")) return K_start;
         if (!strcmp(s, "top")) return K_stop;
+        if (!strcmp(s, "wapon_all")) return K_swapon_all;
         if (!strcmp(s, "ymlink")) return K_symlink;
         if (!strcmp(s, "ysclktz")) return K_sysclktz;
         break;
@@ -550,14 +552,12 @@ void queue_all_property_triggers()
                 if (length > PROP_NAME_MAX) {
                     ERROR("property name too long in trigger %s", act->name);
                 } else {
-                    int ret;
                     memcpy(prop_name, name, length);
                     prop_name[length] = 0;
 
                     /* does the property exist, and match the trigger value? */
-                    ret = property_get(prop_name, value);
-                    if (ret > 0 && (!strcmp(equals + 1, value) ||
-                                    !strcmp(equals + 1, "*"))) {
+                    property_get(prop_name, value);
+                    if (!strcmp(equals + 1, value) ||!strcmp(equals + 1, "*")) {
                         action_add_queue_tail(act);
                     }
                 }
@@ -771,7 +771,7 @@ static void parse_line_service(struct parse_state *state, int nargs, char **args
         svc->envvars = ei;
         break;
     }
-    case K_socket: {/* name type perm [ uid gid context ] */
+    case K_socket: {/* name type perm [ uid gid ] */
         struct socketinfo *si;
         if (nargs < 4) {
             parse_error(state, "socket option requires name, type, perm arguments\n");
@@ -794,8 +794,6 @@ static void parse_line_service(struct parse_state *state, int nargs, char **args
             si->uid = decode_uid(args[4]);
         if (nargs > 5)
             si->gid = decode_uid(args[5]);
-        if (nargs > 6)
-            si->socketcon = args[6];
         si->next = svc->sockets;
         svc->sockets = si;
         break;
